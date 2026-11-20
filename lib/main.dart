@@ -1,5 +1,6 @@
 // lib/main.dart
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
@@ -7,12 +8,52 @@ import 'package:http/http.dart' as http;
 import 'config/api_config.dart';
 import 'screens/main_tab_screen.dart';
 import 'services/biometric_service.dart';
+import 'services/iso_attendance_service.dart';
+import 'services/location_service.dart';
 import 'services/notification_service.dart';
 import 'theme/hyperion_colors.dart';
 
+Future<void> _registrarFinRefrigerioDesdeNotificacion() async {
+  const storage = FlutterSecureStorage();
+  final userId = await storage.read(key: 'user_id');
+  if (userId == null || userId.isEmpty) return;
+
+  final savedType = await storage.read(key: 'last_attendance_type');
+  // Si el trabajador marcó con QR en la mañana, usamos BIOMETRIC_FINGERPRINT para validar geocerca GPS
+  final attendanceType = (savedType == 'HOME_OFFICE')
+      ? 'HOME_OFFICE'
+      : 'BIOMETRIC_FINGERPRINT';
+
+  try {
+    final pos = await LocationService.obtenerUbicacionActual();
+    final res = await IsoAttendanceService.postAttendance(
+      userId: userId,
+      type: attendanceType,
+      actionType: 'LUNCH_END',
+      lat: pos.latitude,
+      lng: pos.longitude,
+      biometricToken: 'notification_lunch_end_ok',
+    );
+
+    if (res['success'] == true) {
+      await NotificationService.cancelarAlertasRefrigerio();
+      NotificationService.lunchEndStatusMessage.value =
+      'OK:${res['message'] ?? 'Fin de refrigerio registrado desde notificación'}';
+    } else {
+      NotificationService.lunchEndStatusMessage.value =
+      'ERR:${res['message'] ?? 'No se pudo registrar el fin de refrigerio'}';
+    }
+  } catch (e) {
+    NotificationService.lunchEndStatusMessage.value =
+    'ERR:Error GPS al registrar fin de refrigerio: $e';
+  }
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await NotificationService.init();
+  await NotificationService.init(
+    onMarkLunchEnd: _registrarFinRefrigerioDesdeNotificacion,
+  );
   runApp(const MyApp());
 }
 
@@ -121,7 +162,8 @@ class _DniLoginScreenState extends State<DniLoginScreen> {
         body: jsonEncode({'dni': dni, 'password': password}),
       );
 
-      final isJson = response.headers['content-type']?.contains('application/json') ?? false;
+      final isJson =
+          response.headers['content-type']?.contains('application/json') ?? false;
 
       if (isJson) {
         final resData = jsonDecode(response.body);
@@ -132,6 +174,11 @@ class _DniLoginScreenState extends State<DniLoginScreen> {
 
           await _storage.write(key: 'user_id', value: userId);
           await _storage.write(key: 'user_name', value: userName);
+
+          // Guardar configuración dinámica de refrigerio y jornadas de la empresa
+          if (resData['companyConfig'] is Map<String, dynamic>) {
+            await IsoAttendanceService.saveCompanyConfig(resData['companyConfig']);
+          }
 
           if (!mounted) return;
 
@@ -148,7 +195,10 @@ class _DniLoginScreenState extends State<DniLoginScreen> {
           _showMessage(resData['error'] ?? 'Credenciales inválidas', Colors.red);
         }
       } else {
-        _showMessage('Error de servidor (${response.statusCode}). Verifique la IP en ApiConfig.', Colors.red);
+        _showMessage(
+          'Error de servidor (${response.statusCode}). Verifique la IP en ApiConfig.',
+          Colors.red,
+        );
       }
     } catch (e) {
       _showMessage('Error de conexión con la PC: $e', Colors.red);
@@ -174,20 +224,31 @@ class _DniLoginScreenState extends State<DniLoginScreen> {
               children: [
                 Icon(Icons.security, size: 80, color: Colors.indigo.shade800),
                 const SizedBox(height: 16),
-                const Text('Ingreso de Trabajador', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                const Text(
+                  'Ingreso de Trabajador',
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                ),
                 const SizedBox(height: 8),
                 const Text('Enrolar Dispositivo para Asistencia'),
                 const SizedBox(height: 30),
                 TextField(
                   controller: _dniController,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(labelText: 'DNI del Empleado', prefixIcon: Icon(Icons.badge), border: OutlineInputBorder()),
+                  decoration: const InputDecoration(
+                    labelText: 'DNI del Empleado',
+                    prefixIcon: Icon(Icons.badge),
+                    border: OutlineInputBorder(),
+                  ),
                 ),
                 const SizedBox(height: 16),
                 TextField(
                   controller: _passController,
                   obscureText: true,
-                  decoration: const InputDecoration(labelText: 'Contraseña', prefixIcon: Icon(Icons.lock), border: OutlineInputBorder()),
+                  decoration: const InputDecoration(
+                    labelText: 'Contraseña',
+                    prefixIcon: Icon(Icons.lock),
+                    border: OutlineInputBorder(),
+                  ),
                 ),
                 const SizedBox(height: 24),
                 _isLoading
@@ -226,11 +287,17 @@ class BiometricLoginScreen extends StatefulWidget {
 
 class _BiometricLoginScreenState extends State<BiometricLoginScreen> {
   final _storage = const FlutterSecureStorage();
+  bool _syncing = false;
 
   Future<void> _autenticar() async {
-    bool autenticado = await BiometricService.autenticarUsuario();
+    bool autenticado = kIsWeb ? true : await BiometricService.autenticarUsuario();
     if (autenticado) {
+      setState(() => _syncing = true);
+      // Sincroniza configuración actualizada de refrigerio antes de entrar
+      await IsoAttendanceService.getTodayStatus(widget.userId);
       if (!mounted) return;
+      setState(() => _syncing = false);
+
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
@@ -263,11 +330,17 @@ class _BiometricLoginScreenState extends State<BiometricLoginScreen> {
             children: [
               Icon(Icons.fingerprint, size: 90, color: Colors.indigo.shade800),
               const SizedBox(height: 20),
-              Text('Bienvenido, ${widget.userName}', textAlign: TextAlign.center, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+              Text(
+                'Bienvenido, ${widget.userName}',
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+              ),
               const SizedBox(height: 10),
               const Text('Confirme su identidad biométrica para continuar'),
               const SizedBox(height: 40),
-              ElevatedButton.icon(
+              _syncing
+                  ? const CircularProgressIndicator()
+                  : ElevatedButton.icon(
                 onPressed: _autenticar,
                 icon: const Icon(Icons.lock_open),
                 label: const Text('Ingresar con Biometría'),
@@ -278,7 +351,10 @@ class _BiometricLoginScreenState extends State<BiometricLoginScreen> {
                 ),
               ),
               const SizedBox(height: 12),
-              TextButton(onPressed: _desvincular, child: const Text('Cerrar sesión / Cambiar DNI')),
+              TextButton(
+                onPressed: _desvincular,
+                child: const Text('Cerrar sesión / Cambiar DNI'),
+              ),
             ],
           ),
         ),

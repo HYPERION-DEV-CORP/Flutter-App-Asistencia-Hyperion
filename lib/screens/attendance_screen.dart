@@ -1,5 +1,7 @@
 // lib/screens/attendance_screen.dart
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:nfc_manager/nfc_manager.dart';
 
@@ -27,6 +29,7 @@ class AttendanceScreen extends StatefulWidget {
 }
 
 class _AttendanceScreenState extends State<AttendanceScreen> {
+  final _storage = const FlutterSecureStorage();
   bool _isLoading = false;
 
   // Acción seleccionada
@@ -38,36 +41,104 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   bool _hasLunchEnd = false;
   bool _hasCheckOut = false;
 
+  // Configuración dinámica sincronizada desde el panel de administración
+  String _lunchWindowStart = '13:00';
+  String _lunchWindowEnd = '13:30';
+  int _lunchDurationMinutes = 60;
+  List<int> _lunchDays = [1, 2, 3, 4, 5];
+
+  /// Evalúa dinámicamente según los días configurados en la empresa (Dom=0, Lun=1 ... Sáb=6)
+  bool get _esDiaConRefrigerio {
+    final dartWeekday = DateTime.now().weekday;
+    final dbWeekday = dartWeekday == 7 ? 0 : dartWeekday;
+    return _lunchDays.contains(dbWeekday);
+  }
+
   @override
   void initState() {
     super.initState();
-    _cargarEstadoInicialDia();
+    _cargarConfiguracionYEstadoDia();
+    NotificationService.lunchEndStatusMessage.addListener(_onNotificationLunchEnd);
   }
 
-  /// Consulta al backend el estado del día para sincronizar botones si la app se reabre
-  Future<void> _cargarEstadoInicialDia() async {
+  @override
+  void dispose() {
+    NotificationService.lunchEndStatusMessage.removeListener(_onNotificationLunchEnd);
+    super.dispose();
+  }
+
+  void _onNotificationLunchEnd() {
+    final payload = NotificationService.lunchEndStatusMessage.value;
+    if (payload == null || !mounted) return;
+
+    NotificationService.lunchEndStatusMessage.value = null;
+
+    if (payload.startsWith('OK:')) {
+      final msg = payload.substring(3);
+      setState(() {
+        _hasLunchEnd = true;
+        if (!_hasCheckOut) _selectedActionType = 'CHECK_OUT';
+      });
+      _mostrarMensaje('¡Fin de Refrigerio Registrado!\n$msg', HyperionColors.successGreen);
+    } else if (payload.startsWith('ERR:')) {
+      final msg = payload.substring(4);
+      _mostrarMensaje(msg, HyperionColors.dangerRed);
+    }
+  }
+
+  Future<void> _cargarConfiguracionYEstadoDia() async {
     setState(() => _isLoading = true);
+
+    // 1. Cargar caché local primero
+    final cached = await IsoAttendanceService.getSavedCompanyConfig();
+    if (mounted) {
+      setState(() {
+        _lunchWindowStart = cached['lunchWindowStart']?.toString() ?? '13:00';
+        _lunchWindowEnd = cached['lunchWindowEnd']?.toString() ?? '13:30';
+        _lunchDurationMinutes = (cached['lunchDurationMinutes'] as num?)?.toInt() ?? 60;
+        _lunchDays = List<int>.from(cached['lunchDays'] ?? [1, 2, 3, 4, 5]);
+      });
+    }
+
+    // 2. Consultar backend para refrescar estado del día y configuración actualizada
     final res = await IsoAttendanceService.getTodayStatus(widget.userId);
     if (res['success'] == true && res['data'] != null) {
+      final freshConfig = res['data']['companyConfig'];
+      if (freshConfig is Map<String, dynamic> && mounted) {
+        setState(() {
+          _lunchWindowStart = freshConfig['lunchWindowStart']?.toString() ?? _lunchWindowStart;
+          _lunchWindowEnd = freshConfig['lunchWindowEnd']?.toString() ?? _lunchWindowEnd;
+          _lunchDurationMinutes =
+              (freshConfig['lunchDurationMinutes'] as num?)?.toInt() ?? _lunchDurationMinutes;
+          _lunchDays = List<int>.from(freshConfig['lunchDays'] ?? _lunchDays);
+        });
+      }
+
       final record = res['data']['record'];
       if (record != null) {
+        if (record['type'] != null) {
+          await _storage.write(key: 'last_attendance_type', value: record['type'].toString());
+        }
         setState(() {
           _hasCheckIn = record['checkIn'] != null;
           _hasLunchStart = record['lunchStart'] != null;
           _hasLunchEnd = record['lunchEnd'] != null;
           _hasCheckOut = record['checkOut'] != null;
 
-          // Auto-seleccionar la siguiente acción lógica pendiente
           if (!_hasCheckIn) {
             _selectedActionType = 'CHECK_IN';
-          } else if (!_hasLunchStart) {
+          } else if (_esDiaConRefrigerio && !_hasLunchStart) {
             _selectedActionType = 'LUNCH_START';
-          } else if (!_hasLunchEnd) {
+          } else if (_esDiaConRefrigerio && !_hasLunchEnd) {
             _selectedActionType = 'LUNCH_END';
           } else if (!_hasCheckOut) {
             _selectedActionType = 'CHECK_OUT';
           }
         });
+
+        if (_esDiaConRefrigerio && _hasCheckIn && !_hasLunchStart && !_hasCheckOut) {
+          await NotificationService.programarAlertaInicioRefrigerio();
+        }
       }
     }
     if (mounted) setState(() => _isLoading = false);
@@ -75,15 +146,26 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
 
   String get _actionLabel {
     switch (_selectedActionType) {
-      case 'CHECK_IN': return 'Entrada';
-      case 'LUNCH_START': return 'Inicio Refrigerio';
-      case 'LUNCH_END': return 'Fin Refrigerio';
-      case 'CHECK_OUT': return 'Salida';
-      default: return 'Marcación';
+      case 'CHECK_IN':
+        return 'Entrada';
+      case 'LUNCH_START':
+        return 'Inicio Refrigerio';
+      case 'LUNCH_END':
+        return 'Fin Refrigerio';
+      case 'CHECK_OUT':
+        return 'Salida';
+      default:
+        return 'Marcación';
     }
   }
 
   bool _validarAccionPermitida() {
+    if (!_esDiaConRefrigerio &&
+        (_selectedActionType == 'LUNCH_START' || _selectedActionType == 'LUNCH_END')) {
+      _mostrarMensaje('El día de hoy no cuenta con turno de refrigerio configurado.', Colors.orange);
+      return false;
+    }
+
     if (_selectedActionType != 'CHECK_IN' && !_hasCheckIn) {
       _mostrarMensaje('Debe registrar su ENTRADA antes de marcar refrigerio o salida.', Colors.orange);
       return false;
@@ -122,15 +204,41 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
       );
 
       if (resultado['success'] == true) {
+        await _storage.write(key: 'last_attendance_type', value: type);
+
+        final completedAction = _selectedActionType;
+        final serverLunchDuration =
+            (resultado['data']?['lunchDurationMinutes'] as num?)?.toInt() ??
+                _lunchDurationMinutes;
+
         setState(() {
-          if (_selectedActionType == 'CHECK_IN') _hasCheckIn = true;
-          if (_selectedActionType == 'LUNCH_START') _hasLunchStart = true;
-          if (_selectedActionType == 'LUNCH_END') _hasLunchEnd = true;
-          if (_selectedActionType == 'CHECK_OUT') _hasCheckOut = true;
+          _lunchDurationMinutes = serverLunchDuration;
+          if (completedAction == 'CHECK_IN') {
+            _hasCheckIn = true;
+            _selectedActionType = _esDiaConRefrigerio ? 'LUNCH_START' : 'CHECK_OUT';
+          } else if (completedAction == 'LUNCH_START') {
+            _hasLunchStart = true;
+            _selectedActionType = 'LUNCH_END';
+          } else if (completedAction == 'LUNCH_END') {
+            _hasLunchEnd = true;
+            _selectedActionType = 'CHECK_OUT';
+          } else if (completedAction == 'CHECK_OUT') {
+            _hasCheckOut = true;
+          }
         });
 
-        if (_selectedActionType == 'LUNCH_START') {
-          await NotificationService.programarAlertaFinRefrigerio();
+        if (completedAction == 'CHECK_IN') {
+          await NotificationService.programarAlertaInicioRefrigerio();
+        } else if (completedAction == 'LUNCH_START') {
+          await NotificationService.cancelarAlertaInicioRefrigerio();
+          await NotificationService.programarAlertaFinRefrigerio(
+            overrideDurationMinutes: serverLunchDuration,
+          );
+        } else if (completedAction == 'LUNCH_END') {
+          await NotificationService.cancelarAlertasRefrigerio();
+        } else if (completedAction == 'CHECK_OUT') {
+          await NotificationService.cancelarAlertaInicioRefrigerio();
+          await NotificationService.cancelarAlertasRefrigerio();
         }
 
         _mostrarMensaje('¡Marcación Registrada!\n${resultado['message']}', HyperionColors.successGreen);
@@ -157,6 +265,10 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
 
   Future<void> _marcarConNFC() async {
     if (!_validarAccionPermitida()) return;
+    if (kIsWeb) {
+      _mostrarMensaje('El lector NFC no está disponible en navegador Web.', Colors.orange);
+      return;
+    }
     bool isAvailable = await NfcManager.instance.isAvailable();
     if (!isAvailable) {
       _mostrarMensaje('El Lector NFC no está activo en este dispositivo.', Colors.orange);
@@ -173,6 +285,10 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
 
   Future<void> _marcarConHuella() async {
     if (!_validarAccionPermitida()) return;
+    if (kIsWeb) {
+      _mostrarMensaje('La biometría nativa no está disponible en navegador Web.', Colors.orange);
+      return;
+    }
     bool autenticado = await BiometricService.autenticarUsuario();
     if (autenticado) {
       await _procesarMarcacion(type: 'BIOMETRIC_FINGERPRINT', biometricToken: 'fingerprint_ok');
@@ -213,9 +329,7 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
             : SingleChildScrollView(
           child: Column(
             children: [
-              // ---------------------------------------------------
               // 1. CABECERA BRANDING HYPERION DIGITAL SECURITY
-              // ---------------------------------------------------
               Container(
                 padding: const EdgeInsets.all(24.0),
                 decoration: const BoxDecoration(
@@ -271,6 +385,11 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                         ],
                       ),
                     ),
+                    IconButton(
+                      onPressed: _cargarConfiguracionYEstadoDia,
+                      icon: const Icon(Icons.refresh, color: HyperionColors.cyanAccent),
+                      tooltip: 'Sincronizar estado y horarios',
+                    ),
                   ],
                 ),
               ),
@@ -280,9 +399,36 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // ---------------------------------------------------
+                    // Banner informativo de horario de refrigerio activo
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 16),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: HyperionColors.primaryNavy.withOpacity(0.08),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: HyperionColors.primaryNavy.withOpacity(0.2)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.schedule, size: 18, color: HyperionColors.primaryNavy),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              _esDiaConRefrigerio
+                                  ? 'Refrigerio hoy: inicio entre $_lunchWindowStart y $_lunchWindowEnd ($_lunchDurationMinutes min).'
+                                  : 'Hoy es jornada continua (sin turno de refrigerio).',
+                              style: const TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
+                                color: HyperionColors.primaryNavy,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
                     // 2. SELECTOR DE JORNADA ESTILIZADO
-                    // ---------------------------------------------------
                     const Text(
                       'FASE DE LA JORNADA',
                       style: TextStyle(
@@ -306,13 +452,13 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                           value: 'LUNCH_START',
                           label: const Text('Ini. Ref', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
                           icon: const Icon(Icons.restaurant, size: 16),
-                          enabled: _hasCheckIn && !_hasLunchStart,
+                          enabled: _esDiaConRefrigerio && _hasCheckIn && !_hasLunchStart,
                         ),
                         ButtonSegment<String>(
                           value: 'LUNCH_END',
                           label: const Text('Fin Ref', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
                           icon: const Icon(Icons.work_history, size: 16),
-                          enabled: _hasLunchStart && !_hasLunchEnd,
+                          enabled: _esDiaConRefrigerio && _hasLunchStart && !_hasLunchEnd,
                         ),
                         ButtonSegment<String>(
                           value: 'CHECK_OUT',
@@ -330,11 +476,17 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                           if (states.contains(WidgetState.selected)) {
                             return HyperionColors.primaryNavy;
                           }
+                          if (states.contains(WidgetState.disabled)) {
+                            return Colors.grey.shade100;
+                          }
                           return Colors.white;
                         }),
                         foregroundColor: WidgetStateProperty.resolveWith<Color>((states) {
                           if (states.contains(WidgetState.selected)) {
                             return HyperionColors.cyanAccent;
+                          }
+                          if (states.contains(WidgetState.disabled)) {
+                            return Colors.grey.shade400;
                           }
                           return const Color(0xFF334155);
                         }),
@@ -353,9 +505,6 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                     ),
                     const SizedBox(height: 14),
 
-                    // ---------------------------------------------------
-                    // 3. TARJETAS DE MARCACIÓN HYPERION
-                    // ---------------------------------------------------
                     _buildHyperionButton(
                       icon: Icons.qr_code_scanner,
                       label: 'Escanear QR Oficina',
@@ -404,7 +553,6 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
                     const Divider(),
                     const SizedBox(height: 10),
 
-                    // 👈 AQUÍ ESTÁ EL CAMBIO DEL BOTÓN
                     OutlinedButton(
                       onPressed: () {
                         Navigator.push(
