@@ -156,11 +156,13 @@ class _DniLoginScreenState extends State<DniLoginScreen> {
     setState(() => _isLoading = true);
 
     try {
-      final response = await http.post(
+      final response = await http
+          .post(
         Uri.parse('${ApiConfig.baseUrl}/auth/login'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({'dni': dni, 'password': password}),
-      );
+      )
+          .timeout(const Duration(seconds: 60));
 
       final isJson =
           response.headers['content-type']?.contains('application/json') ?? false;
@@ -171,11 +173,18 @@ class _DniLoginScreenState extends State<DniLoginScreen> {
         if (response.statusCode == 200 && resData['success'] == true) {
           final userId = resData['user']['id'];
           final userName = resData['user']['name'];
+          final token = resData['token']?.toString();
 
           await _storage.write(key: 'user_id', value: userId);
           await _storage.write(key: 'user_name', value: userName);
+          if (token != null && token.isNotEmpty) {
+            await _storage.write(key: 'auth_token', value: token);
+          }
 
-          // Guardar configuración dinámica de refrigerio y jornadas de la empresa
+          await IsoAttendanceService.saveRemoteAllowed(
+            resData['user']?['isRemoteAllowed'] == true,
+          );
+
           if (resData['companyConfig'] is Map<String, dynamic>) {
             await IsoAttendanceService.saveCompanyConfig(resData['companyConfig']);
           }
@@ -196,12 +205,12 @@ class _DniLoginScreenState extends State<DniLoginScreen> {
         }
       } else {
         _showMessage(
-          'Error de servidor (${response.statusCode}). Verifique la IP en ApiConfig.',
+          'El servidor está iniciando o respondió HTML (${response.statusCode}). Intenta nuevamente en unos segundos.',
           Colors.red,
         );
       }
     } catch (e) {
-      _showMessage('Error de conexión con la PC: $e', Colors.red);
+      _showMessage('No se pudo conectar con el servidor: $e', Colors.red);
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -293,7 +302,7 @@ class _BiometricLoginScreenState extends State<BiometricLoginScreen> {
     bool autenticado = kIsWeb ? true : await BiometricService.autenticarUsuario();
     if (autenticado) {
       setState(() => _syncing = true);
-      // Sincroniza configuración actualizada de refrigerio antes de entrar
+      // Sincroniza configuración actualizada y permiso remoto antes de entrar
       await IsoAttendanceService.getTodayStatus(widget.userId);
       if (!mounted) return;
       setState(() => _syncing = false);

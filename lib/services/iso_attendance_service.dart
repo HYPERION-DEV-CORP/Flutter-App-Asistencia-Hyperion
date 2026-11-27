@@ -7,14 +7,33 @@ import '../config/api_config.dart';
 class IsoAttendanceService {
   static const _storage = FlutterSecureStorage();
   static const String _configStorageKey = 'company_lunch_config';
+  static const String _remoteAllowedKey = 'user_is_remote_allowed';
 
   static Map<String, dynamic> get defaultCompanyConfig => {
+    'biometricCheckInStart': '06:00',
+    'biometricCheckInEnd': '11:59',
     'lunchWindowStart': '13:00',
     'lunchWindowEnd': '13:30',
+    'lunchReturnEnd': '16:59',
     'lunchDurationMinutes': 60,
+    'biometricCheckOutStart': '17:00',
     'lunchDays': [1, 2, 3, 4, 5],
     'saturdayWorkHours': 4.5,
   };
+
+  static Future<void> saveRemoteAllowed(bool? isAllowed) async {
+    if (isAllowed == null) return;
+    await _storage.write(key: _remoteAllowedKey, value: isAllowed ? 'true' : 'false');
+  }
+
+  static Future<bool> getSavedRemoteAllowed() async {
+    try {
+      final raw = await _storage.read(key: _remoteAllowedKey);
+      return raw == 'true';
+    } catch (_) {
+      return false;
+    }
+  }
 
   static Future<void> saveCompanyConfig(Map<String, dynamic>? config) async {
     if (config == null) return;
@@ -39,11 +58,17 @@ class IsoAttendanceService {
         headers: {'Content-Type': 'application/json'},
       );
 
-      final isJson = response.headers['content-type']?.contains('application/json') ?? false;
+      final isJson =
+          response.headers['content-type']?.contains('application/json') ?? false;
       if (isJson && response.statusCode == 200) {
-        final decoded = jsonDecode(response.body);
+        final decoded = jsonDecode(response.body) as Map<String, dynamic>;
         if (decoded['companyConfig'] is Map<String, dynamic>) {
-          await saveCompanyConfig(decoded['companyConfig']);
+          await saveCompanyConfig(decoded['companyConfig'] as Map<String, dynamic>);
+        }
+        if (decoded['isRemoteAllowed'] is bool) {
+          await saveRemoteAllowed(decoded['isRemoteAllowed'] as bool);
+        } else if (decoded['user'] is Map && decoded['user']['isRemoteAllowed'] is bool) {
+          await saveRemoteAllowed(decoded['user']['isRemoteAllowed'] as bool);
         }
         return {'success': true, 'data': decoded};
       }
@@ -81,10 +106,11 @@ class IsoAttendanceService {
         }),
       );
 
-      final isJson = response.headers['content-type']?.contains('application/json') ?? false;
+      final isJson =
+          response.headers['content-type']?.contains('application/json') ?? false;
 
       if (isJson) {
-        final data = jsonDecode(response.body);
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
         if (response.statusCode == 200 || response.statusCode == 201) {
           return {
             'success': true,
@@ -100,13 +126,15 @@ class IsoAttendanceService {
       } else {
         return {
           'success': false,
-          'message': 'Respuesta no válida del servidor (${response.statusCode}). Verifique la conexión con Next.js.',
+          'message':
+          'Respuesta no válida del servidor (${response.statusCode}). Verifique la conexión con Next.js.',
         };
       }
     } catch (e) {
       return {
         'success': false,
-        'message': 'Error de conexión o red: ${e.toString().replaceAll('Exception: ', '')}',
+        'message':
+        'Error de conexión o red: ${e.toString().replaceAll('Exception: ', '')}',
       };
     }
   }
